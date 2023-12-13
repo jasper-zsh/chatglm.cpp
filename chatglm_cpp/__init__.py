@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import chatglm_cpp._C as _C
-from chatglm_cpp._C import ChatMessage
+from chatglm_cpp._C import ChatMessage, FunctionMessage
 
 __version__ = "0.3.1.dev"
 

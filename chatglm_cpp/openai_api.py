@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from typing import List, Literal, Optional, Union
@@ -17,16 +18,23 @@ class Settings(BaseSettings):
     model: str = "chatglm-ggml.bin"
     num_threads: int = 0
 
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
-
+    function_call: Optional[FunctionCall] = None
 
 class DeltaMessage(BaseModel):
     role: Optional[Literal["system", "user", "assistant"]] = None
     content: Optional[str] = None
 
+class Function(BaseModel):
+    name: str
+    description: str
+    parameters: dict
 
 class ChatCompletionRequest(BaseModel):
     model: str = "default-model"
@@ -35,6 +43,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(default=0.7, ge=0.0, le=1.0)
     stream: bool = False
     max_tokens: int = Field(default=2048, ge=0)
+    functions: Optional[List[Function]] = None
 
     model_config = {
         "json_schema_extra": {"examples": [{"model": "default-model", "messages": [{"role": "user", "content": "你好"}]}]}
@@ -44,7 +53,7 @@ class ChatCompletionRequest(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int = 0
     message: ChatMessage
-    finish_reason: Literal["stop", "length"] = "stop"
+    finish_reason: Literal["stop", "length", "function_call"] = "stop"
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
@@ -147,7 +156,12 @@ async def create_chat_completion(body: ChatCompletionRequest) -> ChatCompletionR
     if not body.messages:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty messages")
 
-    messages = [chatglm_cpp.ChatMessage(role=msg.role, content=msg.content) for msg in body.messages]
+    messages = []
+
+    if body.functions:
+        messages.append(chatglm_cpp.ChatMessage(role='system', content='Answer the following questions as best as you can. You have access to the following tools:\n'+json.dumps(body.functions, indent=2, ensure_ascii=False)))
+
+    messages.extend(chatglm_cpp.ChatMessage(role=msg.role, content=msg.content) for msg in body.messages)
 
     if body.stream:
         generator = stream_chat_event_publisher(messages, body)
@@ -165,13 +179,26 @@ async def create_chat_completion(body: ChatCompletionRequest) -> ChatCompletionR
     logging.info(f'prompt: "{messages[-1].content}", sync response: "{output.content}"')
     prompt_tokens = len(pipeline.tokenizer.encode_messages(messages, max_context_length))
     completion_tokens = len(pipeline.tokenizer.encode(output.content, body.max_tokens))
+    res = ChatCompletionResponse(
+            object="chat.completion",
+            choices=[ChatCompletionResponseChoice(message=ChatMessage(role="assistant", content=output.content))],
+            usage=ChatCompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+        )
+    if output.tool_calls and output.tool_calls[0].function:
+        (tool_call,) = output.tool_calls
+        (choice,) = res.choices
+        if tool_call.function:
+            choice.message.function_call = parse_tool_call_function(tool_call.function)
+            choice.message.content = ''
+            choice.finish_reason = 'function_call'
+    
+    return res
 
-    return ChatCompletionResponse(
-        object="chat.completion",
-        choices=[ChatCompletionResponseChoice(message=ChatMessage(role="assistant", content=output.content))],
-        usage=ChatCompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
-    )
-
+def parse_tool_call_function(f: chatglm_cpp.FunctionMessage):
+    def tool_call(**kwargs):
+        return kwargs
+    arguments = eval(f.arguments)
+    return FunctionCall(name=f.name, arguments=json.dumps(arguments, ensure_ascii=False))
 
 class ModelCard(BaseModel):
     id: str
