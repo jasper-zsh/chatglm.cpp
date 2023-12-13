@@ -23,9 +23,10 @@ class FunctionCall(BaseModel):
     arguments: str
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
+    role: Literal["system", "user", "assistant", "function"]
     content: str
     function_call: Optional[FunctionCall] = None
+    name: Optional[str] = None
 
 class DeltaMessage(BaseModel):
     role: Optional[Literal["system", "user", "assistant"]] = None
@@ -151,7 +152,7 @@ async def stream_chat_event_publisher(history, body):
         raise e
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", response_model_exclude_none=True)
 async def create_chat_completion(body: ChatCompletionRequest) -> ChatCompletionResponse:
     if not body.messages:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty messages")
@@ -159,9 +160,9 @@ async def create_chat_completion(body: ChatCompletionRequest) -> ChatCompletionR
     messages = []
 
     if body.functions:
-        messages.append(chatglm_cpp.ChatMessage(role='system', content='Answer the following questions as best as you can. You have access to the following tools:\n'+json.dumps(body.functions, indent=2, ensure_ascii=False)))
+        messages.append(chatglm_cpp.ChatMessage(role='system', content='Answer the following questions as best as you can. You have access to the following tools:\n'+ json.dumps([f.model_dump() for f in body.functions], indent=2, ensure_ascii=False)))
 
-    messages.extend(chatglm_cpp.ChatMessage(role=msg.role, content=msg.content) for msg in body.messages)
+    messages.extend(parse_message(msg) for msg in body.messages)
 
     if body.stream:
         generator = stream_chat_event_publisher(messages, body)
@@ -193,6 +194,13 @@ async def create_chat_completion(body: ChatCompletionRequest) -> ChatCompletionR
             choice.finish_reason = 'function_call'
     
     return res
+
+def parse_message(msg: ChatMessage) -> chatglm_cpp.ChatMessage:
+    if msg.role == 'function':
+        return chatglm_cpp.ChatMessage(role='observation', content=f'Result of {msg.name} : {msg.content}')
+    else:
+        return chatglm_cpp.ChatMessage(role=msg.role, content=msg.content)
+
 
 def parse_tool_call_function(f: chatglm_cpp.FunctionMessage):
     def tool_call(**kwargs):
